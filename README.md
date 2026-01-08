@@ -74,3 +74,7 @@ shadowmount.elf
     * LightningMods
     * john-tornblom
     * PS5 R&D Community
+
+---
+
+[![ko-fi](https://ko-fi.com/img/githubbutton_sm.svg)](https://ko-fi.com/voidwhisper)
