@@ -14,15 +14,19 @@
 #include <stdbool.h>
 #include <time.h>
 #include <sys/syscall.h>
+#include <sys/ioctl.h>
+#include <sys/mdioctl.h>
 
-#include <ps5/kernel.h> 
+#include <ps5/kernel.h>
 
 // --- Configuration ---
-#define SCAN_INTERVAL_US    3000000 
-#define MAX_PENDING         512     
+#define SCAN_INTERVAL_US    3000000
+#define MAX_PENDING         512
+#define MAX_UFS_MOUNTS      64
 #define MAX_PATH            1024
 #define MAX_TITLE_ID        32
 #define MAX_TITLE_NAME      256
+#define UFS_MOUNT_BASE      "/data/ufsmnt"
 #define LOG_DIR             "/data/shadowmount"
 #define LOG_FILE            "/data/shadowmount/debug.log"
 #define LOCK_FILE           "/data/shadowmount/daemon.lock"
@@ -71,7 +75,10 @@ const char* SCAN_PATHS[] = {
     "/mnt/usb0", "/mnt/usb1", "/mnt/usb2", "/mnt/usb3",
     "/mnt/usb4", "/mnt/usb5", "/mnt/usb6", "/mnt/usb7",
     "/mnt/ext0", "/mnt/ext1",
-    
+
+    // UFS Mounted Images
+    UFS_MOUNT_BASE,
+
     NULL
 };
 
@@ -82,6 +89,13 @@ struct GameCache {
     bool valid; 
 };
 struct GameCache cache[MAX_PENDING];
+
+struct UfsCache {
+    char path[MAX_PATH];
+    unsigned md_unit;
+    bool valid;
+};
+struct UfsCache ufs_cache[MAX_UFS_MOUNTS];
 
 // --- LOGGING ---
 void log_to_file(const char* fmt, va_list args) {
@@ -176,6 +190,201 @@ int copy_file(const char* src, const char* dst) {
     FILE* fd = fopen(dst, "wb"); if (!fd) { fclose(fs); return -1; }
     size_t n; while ((n = fread(buf, 1, sizeof(buf), fs)) > 0) fwrite(buf, 1, n, fd);
     fclose(fd); fclose(fs); return 0;
+}
+
+// --- UFS2 IMAGE MOUNTING ---
+static void build_iovec(struct iovec **iov, int *iovlen, const char *name, const void *val, size_t len) {
+    int i;
+    if (*iovlen < 0) return;
+    i = *iovlen;
+    *iov = realloc(*iov, sizeof(**iov) * (i + 2));
+    if (*iov == NULL) { *iovlen = -1; return; }
+    (*iov)[i].iov_base = strdup(name);
+    (*iov)[i].iov_len = strlen(name) + 1;
+    i++;
+    (*iov)[i].iov_base = (void *)val;
+    if (len == (size_t)-1) {
+        len = val ? strlen((const char *)val) + 1 : 0;
+    }
+    (*iov)[i].iov_len = (int)len;
+    *iovlen = ++i;
+}
+
+static bool is_ufs_image(const char* name) {
+    const char* dot = strrchr(name, '.');
+    if (!dot) return false;
+    return (strcasecmp(dot, ".ffpkg") == 0 || strcasecmp(dot, ".dat") == 0);
+}
+
+static void strip_extension(const char* filename, char* out, size_t out_size) {
+    const char* dot = strrchr(filename, '.');
+    size_t len = dot ? (size_t)(dot - filename) : strlen(filename);
+    if (len >= out_size) len = out_size - 1;
+    memcpy(out, filename, len);
+    out[len] = '\0';
+}
+
+static bool mount_ufs_image(const char* file_path) {
+    // Check if already in UFS cache
+    for (int k = 0; k < MAX_UFS_MOUNTS; k++) {
+        if (ufs_cache[k].valid && strcmp(ufs_cache[k].path, file_path) == 0) return true;
+    }
+
+    // Extract filename and strip extension for mount point name
+    const char* filename = strrchr(file_path, '/');
+    filename = filename ? filename + 1 : file_path;
+    char mount_name[MAX_PATH];
+    strip_extension(filename, mount_name, sizeof(mount_name));
+
+    char mount_point[MAX_PATH];
+    snprintf(mount_point, sizeof(mount_point), "%s/%s", UFS_MOUNT_BASE, mount_name);
+
+    // Check if already mounted (e.g. from previous run)
+    struct stat mst;
+    if (stat(mount_point, &mst) == 0 && S_ISDIR(mst.st_mode)) {
+        // Check if there's content inside (already mounted)
+        DIR* check = opendir(mount_point);
+        if (check) {
+            int count = 0;
+            struct dirent* ce;
+            while ((ce = readdir(check)) != NULL) {
+                if (ce->d_name[0] != '.') { count++; break; }
+            }
+            closedir(check);
+            if (count > 0) {
+                log_debug("  [UFS] Already mounted: %s", mount_point);
+                // Add to cache so we don't re-check
+                for (int k = 0; k < MAX_UFS_MOUNTS; k++) {
+                    if (!ufs_cache[k].valid) {
+                        strncpy(ufs_cache[k].path, file_path, MAX_PATH);
+                        ufs_cache[k].md_unit = 0;
+                        ufs_cache[k].valid = true;
+                        break;
+                    }
+                }
+                return true;
+            }
+        }
+    }
+
+    // Get file size
+    struct stat st;
+    if (stat(file_path, &st) != 0) {
+        log_debug("  [UFS] stat failed for %s: %s", file_path, strerror(errno));
+        return false;
+    }
+
+    // Stability check - wait if file is still being written
+    double age = difftime(time(NULL), st.st_mtime);
+    if (age < 10.0) {
+        log_debug("  [UFS] %s modified %.0fs ago, waiting...", filename, age);
+        return false;
+    }
+
+    log_debug("  [UFS] Mounting image: %s -> %s", file_path, mount_point);
+
+    // Create mount point
+    mkdir(UFS_MOUNT_BASE, 0777);
+    mkdir(mount_point, 0777);
+
+    // Attach as md device
+    int mdctl = open("/dev/mdctl", O_RDWR);
+    if (mdctl < 0) {
+        log_debug("  [UFS] open /dev/mdctl failed: %s", strerror(errno));
+        return false;
+    }
+
+    struct md_ioctl mdio;
+    memset(&mdio, 0, sizeof(mdio));
+    mdio.md_version = MDIOVERSION;
+    mdio.md_type = MD_VNODE;
+    mdio.md_file = (char*)file_path;
+    mdio.md_mediasize = st.st_size;
+    mdio.md_sectorsize = 512;
+    mdio.md_options = MD_AUTOUNIT | MD_READONLY;
+
+    int ret = ioctl(mdctl, MDIOCATTACH, &mdio);
+    if (ret != 0) {
+        mdio.md_options = MD_AUTOUNIT;
+        ret = ioctl(mdctl, MDIOCATTACH, &mdio);
+        if (ret != 0) {
+            log_debug("  [UFS] MDIOCATTACH failed: %s", strerror(errno));
+            close(mdctl);
+            return false;
+        }
+    }
+
+    char devname[64];
+    snprintf(devname, sizeof(devname), "/dev/md%u", mdio.md_unit);
+    log_debug("  [UFS] Attached as %s", devname);
+    close(mdctl);
+
+    // Mount UFS filesystem
+    struct iovec *iov = NULL;
+    int iovlen = 0;
+    build_iovec(&iov, &iovlen, "fstype", "ufs", (size_t)-1);
+    build_iovec(&iov, &iovlen, "fspath", mount_point, (size_t)-1);
+    build_iovec(&iov, &iovlen, "from", devname, (size_t)-1);
+
+    ret = nmount(iov, iovlen, MNT_RDONLY);
+    if (ret != 0) {
+        log_debug("  [UFS] nmount rdonly failed: %s, trying rw...", strerror(errno));
+        ret = nmount(iov, iovlen, 0);
+        if (ret != 0) {
+            log_debug("  [UFS] nmount failed: %s", strerror(errno));
+            free(iov);
+            return false;
+        }
+    }
+    free(iov);
+
+    log_debug("  [UFS] Mounted %s -> %s", devname, mount_point);
+
+    // Cache it
+    for (int k = 0; k < MAX_UFS_MOUNTS; k++) {
+        if (!ufs_cache[k].valid) {
+            strncpy(ufs_cache[k].path, file_path, MAX_PATH);
+            ufs_cache[k].md_unit = mdio.md_unit;
+            ufs_cache[k].valid = true;
+            break;
+        }
+    }
+
+    return true;
+}
+
+static void scan_ufs_images() {
+    // Clean stale UFS cache entries
+    for (int k = 0; k < MAX_UFS_MOUNTS; k++) {
+        if (ufs_cache[k].valid && access(ufs_cache[k].path, F_OK) != 0) {
+            log_debug("  [UFS] Cache invalidated: %s", ufs_cache[k].path);
+            ufs_cache[k].valid = false;
+        }
+    }
+
+    for (int i = 0; SCAN_PATHS[i] != NULL; i++) {
+        // Skip the UFS mount base itself to avoid recursion
+        if (strcmp(SCAN_PATHS[i], UFS_MOUNT_BASE) == 0) continue;
+
+        DIR* d = opendir(SCAN_PATHS[i]);
+        if (!d) continue;
+
+        struct dirent* entry;
+        while ((entry = readdir(d)) != NULL) {
+            if (entry->d_name[0] == '.') continue;
+            if (!is_ufs_image(entry->d_name)) continue;
+
+            char full_path[MAX_PATH];
+            snprintf(full_path, sizeof(full_path), "%s/%s", SCAN_PATHS[i], entry->d_name);
+
+            // Verify it's a regular file
+            struct stat st;
+            if (stat(full_path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+
+            mount_ufs_image(full_path);
+        }
+        closedir(d);
+    }
 }
 
 // --- JSON & DRM ---
@@ -378,17 +587,20 @@ int main() {
     remove(LOG_FILE); 
     mkdir(LOG_DIR, 0777);
     
-    log_debug("SHADOWMOUNT v1.3 START");
-    
+    log_debug("SHADOWMOUNT v1.4 START");
+
+    // --- MOUNT UFS IMAGES ---
+    scan_ufs_images();
+
     // --- STARTUP LOGIC ---
     int new_games = count_new_candidates();
     
     if (new_games == 0) {
         // SCENARIO A: Nothing to do.
-        notify_system("ShadowMount v1.3: Library Ready.\n- VoidWhisper");
+        notify_system("ShadowMount v1.4: Library Ready.\n- VoidWhisper");
     } else {
         // SCENARIO B: Work needed.
-        notify_system("ShadowMount v1.3: Found %d Games. Executing...", new_games);
+        notify_system("ShadowMount v1.4: Found %d Games. Executing...", new_games);
         
         // Run the scan immediately to process them
         scan_all_paths();
@@ -406,7 +618,8 @@ int main() {
         
         // Sleep FIRST since we either just finished scan above, or library was ready.
         sceKernelUsleep(SCAN_INTERVAL_US);
-        
+
+        scan_ufs_images();
         scan_all_paths();
     }
     

@@ -1,5 +1,5 @@
 # ShadowMount (PS5)
-**v1.3 Beta by VoidWhisper**
+**v1.4 Beta by VoidWhisper**
 
 **ShadowMount** is a fully automated, background "Auto-Mounter" payload for Jailbroken PlayStation 5 consoles. It streamlines the game mounting process by eliminating the need for manual configuration or external tools (such as DumpRunner or Itemzflow). ShadowMount automatically detects, mounts, and installs game dumps from both **internal and external storage**.
 
@@ -19,6 +19,7 @@
     * **System Notifications:** Non-intrusive status updates for new installations.
     * **Rich Toasts (Optional):** Graphical pop-ups confirming "Game Installed".
       * *Note: This feature requires `notify.elf`. It is kept as a separate payload for users who prefer a cleaner experience without pop-ups.*
+* **UFS2 Support (FFPKG):** Experimental UFS2 Support for mounting images made with [mkufs2](https://github.com/earthonion/mkufs2).
 
 ---
 
